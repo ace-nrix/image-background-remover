@@ -24,38 +24,60 @@ Databricks Model Serving  (GPU — rembg u2net)
 
 ```
 POST /remove-background
+GET  /health  →  {"status": "ok"}
 ```
 
-| Field                | Type   | Required           | Description                                                           |
-| -------------------- | ------ | ------------------ | --------------------------------------------------------------------- |
-| `image`              | file   | yes                | Input image in any PIL-readable format                                |
-| `whitespace_percent` | float  | no (default: `10`) | Padding around subject. `15` → subject fills 85% of canvas            |
-| `bg_color`           | string | no                 | CSS color name (`white`) or hex (`#ff0000`). Omit for transparent PNG |
+### Parameters
 
-```
-GET /health  →  {"status": "ok"}
-```
+| Parameter                            | Type   | Default     | Range          | Description                                                                                                                                                                                                                                                                                         |
+| ------------------------------------ | ------ | ----------- | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `image`                              | file   | —           | —              | Input image (JPEG, PNG, WebP, or any PIL-readable format)                                                                                                                                                                                                                                           |
+| `whitespace_percent`                 | float  | **15**      | 0–99           | Amount of padding to leave around the subject. `15` means the subject fills 85% of the canvas. Lower = subject larger; higher = more breathing room around it.                                                                                                                                      |
+| `bg_color`                           | string | **"white"** | any CSS colour | Background colour of the output. Accepts CSS names (`white`, `red`, `cornflowerblue`) or hex values (`#ff0000`). When set the output is a JPEG. Pass an empty string for a transparent PNG.                                                                                                         |
+| `output_size`                        | int    | **1800**    | ≥ 1            | Output canvas size in pixels. The canvas is always square (`output_size × output_size`). The subject is scaled to fit and centred. Pass empty to keep the original image dimensions (non-square).                                                                                                   |
+| `feathering`                         | float  | **0**       | 0–20           | Softens the cutout edges by blurring the alpha channel. `0` = hard edges exactly as the model produced them. Higher values create a smoother, more gradual edge — useful when compositing onto new backgrounds.                                                                                     |
+| `alpha_threshold`                    | int    | **0**       | 0–254          | Clips semi-transparent fringe pixels to fully transparent. `0` = keep everything the model produced, including uncertain edge pixels. Raising this value cuts the halo or colour bleed around edges more aggressively. Try `15`–`40` if you see a thin outline or colour fringe around the subject. |
+| `alpha_matting`                      | bool   | **false**   | true/false     | Enables alpha matting for significantly tighter, more accurate edges. See the [Alpha Matting](#alpha-matting) section below.                                                                                                                                                                        |
+| `alpha_matting_foreground_threshold` | int    | **240**     | 1–255          | Only used when `alpha_matting=true`. Pixels with a model confidence score ≥ this value are treated as definitely foreground. Lower values cause more pixels to be considered "definitely subject".                                                                                                  |
+| `alpha_matting_background_threshold` | int    | **10**      | 0–254          | Only used when `alpha_matting=true`. Pixels with a confidence score ≤ this value are treated as definitely background. Higher values cause more pixels to be considered "definitely background".                                                                                                    |
+| `alpha_matting_erode_size`           | int    | **10**      | 0–30           | Only used when `alpha_matting=true`. Controls how far the uncertain boundary zone is shrunk before matting is applied. Higher = tighter initial mask; lower = more pixels are re-examined.                                                                                                          |
+
+### Alpha Matting
+
+The rembg model outputs a **confidence score** for every pixel — how likely it is to be part of the subject. Pixels in the middle of the subject get a score near 255 (definitely foreground); pixels clearly in the background get near 0. Pixels at the boundary edges get intermediate scores (e.g. 40–180) because the model is uncertain.
+
+**Without alpha matting** those uncertain edge pixels are kept as semi-transparent, which can produce a soft halo or colour bleed from the original background.
+
+**With alpha matting** (`alpha_matting=true`) the app re-examines each uncertain boundary pixel using the _original image colours_ — "does this pixel look more like the subject interior or the background?" — and reassigns a more accurate alpha value. This produces tighter, cleaner edges, especially when the subject and background have distinct colours.
+
+Trade-off: alpha matting is **~2–5× slower** than standard mode because it requires an additional colour-based solve per image.
 
 ### Example — curl
 
 ```bash
 APP_URL="https://image-background-remover-<org>.azuredatabricks.net"
 
-# Transparent PNG
+# Default (white background, 1800x1800 JPEG)
 curl -X POST "$APP_URL/remove-background" \
   -F "image=@photo.jpg" \
-  -F "whitespace_percent=15" \
+  -o result.jpg
+
+# Transparent PNG, 15% padding, no size constraint
+curl -X POST "$APP_URL/remove-background" \
+  -F "image=@photo.jpg" \
+  -F "bg_color=" \
+  -F "output_size=" \
   -o result.png
 
-# White background JPEG
+# Tight edges with alpha matting
 curl -X POST "$APP_URL/remove-background" \
   -F "image=@photo.jpg" \
-  -F "whitespace_percent=10" \
-  -F "bg_color=white" \
+  -F "alpha_matting=true" \
+  -F "alpha_threshold=20" \
   -o result.jpg
 ```
 
-Interactive docs at `<APP_URL>/docs`.
+Interactive docs (Swagger UI) at `<APP_URL>/docs`.
 
 ---
 

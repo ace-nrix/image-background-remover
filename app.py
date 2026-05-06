@@ -7,38 +7,67 @@ Serving endpoint. This app handles HTTP, image encoding, cropping, scaling,
 and canvas composition on CPU serverless compute.
 
 POST /remove-background
-    image              : (file)   input image, any format PIL can read
-    whitespace_percent : (float)  padding around subject as % of output canvas, default 10
-                                  e.g. 15 → subject fills 85% of the output image
-    bg_color           : (string) optional background fill, e.g. "white" or "#ff0000"
-                                  omit entirely for a transparent PNG output
-    output_size        : (int)    optional square output canvas in pixels, e.g. 1800
-                                  crops a square region centred on the subject then
-                                  scales to output_size × output_size
-                                  omit to preserve the original image dimensions
-    alpha_matting                  : (bool)  enable alpha matting for tighter edges, default false
-                                  uses the original image's colour data to re-solve
-                                  the uncertain boundary zone — best for coloured backgrounds
-    alpha_matting_foreground_threshold : (int) confidence ≥ this = definite foreground, default 240
-                                  range 1–255
-    alpha_matting_background_threshold : (int) confidence ≤ this = definite background, default 10
-                                  range 0–254
-    alpha_matting_erode_size       : (int)  how aggressively to erode the uncertain zone, default 10
-                                  range 0–30
-    feathering         : (float)  Gaussian blur radius applied to the alpha channel, default 0
-                                  0 = hard edges as returned by rembg
-                                  range 0–20 (practical); higher = softer/more feathered edges
-    alpha_threshold    : (int)    pixels with alpha ≤ this value are clipped to 0, default 0
-                                  0 = keep all semi-transparent pixels rembg produced
-                                  range 0–254; higher = harder cutoff, removes fringe pixels
 
-GET /health
-    → {"status": "ok"}
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ Parameter                         Default   Range / Notes               │
+  ├─────────────────────────────────────────────────────────────────────────┤
+  │ image                (file)        —         Any PIL-readable format     │
+  │                                                                         │
+  │ whitespace_percent   (float)       15        0–99                        │
+  │   How much empty space (padding) to leave around the subject.           │
+  │   15 means the subject fills 85% of the output canvas.                 │
+  │   Lower = subject fills more of the image; higher = more breathing room.│
+  │                                                                         │
+  │ bg_color             (string)      "white"   CSS name or hex (#ff0000)   │
+  │   Background colour of the output image.                                │
+  │   When set, output is a flat-colour JPEG.                               │
+  │   Pass empty / omit for a transparent PNG.                              │
+  │                                                                         │
+  │ output_size          (int)         1800      ≥ 1                         │
+  │   Output canvas size in pixels (square: output_size × output_size).     │
+  │   The subject is centred and scaled to fit within the canvas.           │
+  │   Omit to preserve the original image dimensions (non-square).         │
+  │                                                                         │
+  │ feathering           (float)       0         0–20                        │
+  │   Softens the edges of the cutout by blurring the alpha channel.        │
+  │   0 = hard edges exactly as the model produced them.                    │
+  │   Higher values make edges progressively softer / more blended.        │
+  │   Useful for compositing onto new backgrounds.                          │
+  │                                                                         │
+  │ alpha_threshold      (int)         0         0–254                       │
+  │   Clips semi-transparent fringe pixels to fully transparent.            │
+  │   0 = keep every pixel the model produced, including uncertain edges.   │
+  │   Higher values cut the halo/fringe more aggressively.                 │
+  │   Try 15–40 to remove colour bleeding around the subject edges.         │
+  │                                                                         │
+  │ alpha_matting        (bool)        false     true / false                │
+  │   Enables alpha matting for significantly tighter, more accurate edges. │
+  │   rembg outputs a confidence score per pixel. Pixels near the subject   │
+  │   edge get intermediate values (e.g. 40–180) because the model is       │
+  │   uncertain. Alpha matting re-examines those uncertain boundary pixels  │
+  │   using the original image colour — "does this pixel look more like the │
+  │   subject interior or the background?" — and reassigns a more accurate  │
+  │   alpha value. Best when the background is a distinct colour.           │
+  │   Slower than standard mode (~2–5× longer inference time).              │
+  │                                                                         │
+  │ alpha_matting_foreground_threshold (int)  240   1–255                   │
+  │   Pixels with confidence ≥ this are treated as definite foreground.     │
+  │   Lower = more pixels classified as "definitely subject".               │
+  │                                                                         │
+  │ alpha_matting_background_threshold (int)   10   0–254                   │
+  │   Pixels with confidence ≤ this are treated as definite background.     │
+  │   Higher = more pixels classified as "definitely background".           │
+  │                                                                         │
+  │ alpha_matting_erode_size           (int)   10   0–30                    │
+  │   How far to shrink the uncertain boundary zone before matting.         │
+  │   Higher = tighter initial mask; lower = more pixels re-examined.      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+GET /health  →  {"status": "ok"}
 
 Required environment variables:
-    DATABRICKS_HOST            Workspace URL, e.g. https://adb-....azuredatabricks.net
-    DATABRICKS_TOKEN           Personal access token or service-principal secret
     REMBG_SERVING_ENDPOINT     Model Serving endpoint name (default: rembg-u2net)
+    DATABRICKS_HOST / auth     Auto-handled by Databricks App runtime
 """
 
 import base64
@@ -49,7 +78,7 @@ from typing import Optional
 from databricks.sdk import WorkspaceClient
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
-from PIL import Image, ImageColor
+from PIL import Image, ImageColor, ImageFilter
 
 app = FastAPI(title="Image Background Remover API", version="2.0.0")
 
@@ -60,12 +89,16 @@ _client   = WorkspaceClient()  # auto-authenticates inside a Databricks App
 print(f"Inference endpoint: {_ENDPOINT}", flush=True)
 
 
-def _call_rembg(
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline steps — each function does one thing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def call_rembg(
     img: Image.Image,
-    alpha_matting: bool = False,
-    alpha_matting_foreground_threshold: int = 240,
-    alpha_matting_background_threshold: int = 10,
-    alpha_matting_erode_size: int = 10,
+    alpha_matting: bool,
+    alpha_matting_foreground_threshold: int,
+    alpha_matting_background_threshold: int,
+    alpha_matting_erode_size: int,
 ) -> Image.Image:
     """Send image to the GPU Model Serving endpoint; return RGBA result."""
     buf = io.BytesIO()
@@ -83,11 +116,101 @@ def _call_rembg(
         )
     except Exception as e:
         raise HTTPException(
-            status_code=502, detail=f"Background removal service unavailable: {e}"
+            status_code=502,
+            detail=f"Background removal service unavailable: {e}",
         )
     rgba_b64 = response.predictions[0]["rgba_b64"]
     return Image.open(io.BytesIO(base64.b64decode(rgba_b64)))
 
+
+def apply_alpha_post_processing(
+    img: Image.Image,
+    feathering: float,
+    alpha_threshold: int,
+) -> Image.Image:
+    """Apply feathering and/or threshold clipping to the alpha channel."""
+    if feathering == 0.0 and alpha_threshold == 0:
+        return img
+    r, g, b, a = img.split()
+    if feathering > 0.0:
+        a = a.filter(ImageFilter.GaussianBlur(radius=feathering))
+    if alpha_threshold > 0:
+        a = a.point(lambda p: 0 if p <= alpha_threshold else p)
+    return Image.merge("RGBA", (r, g, b, a))
+
+
+def scale_subject_onto_canvas(
+    subject: Image.Image,
+    canvas_size: tuple,
+    whitespace_percent: float,
+) -> tuple:
+    """Scale subject to fill (100 - whitespace_percent)% of canvas; return (resized, paste_offset)."""
+    canvas_w, canvas_h = canvas_size
+    w_s, h_s = subject.size
+    target_fill = 1.0 - whitespace_percent / 100.0
+    scale = min((canvas_w * target_fill) / w_s, (canvas_h * target_fill) / h_s)
+    new_w = max(1, round(w_s * scale))
+    new_h = max(1, round(h_s * scale))
+    resized = subject.resize((new_w, new_h), Image.LANCZOS)
+    paste_x = (canvas_w - new_w) // 2
+    paste_y = (canvas_h - new_h) // 2
+    return resized, (paste_x, paste_y)
+
+
+def build_canvas(canvas_size: tuple, bg_color: Optional[str]) -> Image.Image:
+    """Create a blank canvas — flat colour (RGBA) or transparent."""
+    w, h = canvas_size
+    if bg_color:
+        try:
+            r, g, b = ImageColor.getrgb(bg_color)
+            return Image.new("RGBA", (w, h), (r, g, b, 255))
+        except (ValueError, AttributeError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid bg_color: {bg_color!r}. Use a CSS name or hex, e.g. #ff0000.",
+            )
+    return Image.new("RGBA", (w, h), (0, 0, 0, 0))
+
+
+def encode_output(canvas: Image.Image, bg_color: Optional[str]) -> Response:
+    """Encode canvas to JPEG (flat bg) or PNG (transparent) and return HTTP response."""
+    buf = io.BytesIO()
+    if bg_color:
+        canvas.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+        return Response(content=buf.getvalue(), media_type="image/jpeg")
+    canvas.save(buf, format="PNG", optimize=True)
+    return Response(content=buf.getvalue(), media_type="image/png")
+
+
+def validate_params(
+    whitespace_percent: float,
+    output_size: Optional[int],
+    feathering: float,
+    alpha_threshold: int,
+    alpha_matting_foreground_threshold: int,
+    alpha_matting_background_threshold: int,
+    alpha_matting_erode_size: int,
+) -> None:
+    """Raise 422 for any out-of-range parameter."""
+    if not (0.0 <= whitespace_percent < 100.0):
+        raise HTTPException(status_code=422, detail="whitespace_percent must be >= 0 and < 100")
+    if output_size is not None and output_size < 1:
+        raise HTTPException(status_code=422, detail="output_size must be a positive integer")
+    if not (0.0 <= feathering <= 20.0):
+        raise HTTPException(status_code=422, detail="feathering must be between 0 and 20")
+    if not (0 <= alpha_threshold <= 254):
+        raise HTTPException(status_code=422, detail="alpha_threshold must be between 0 and 254")
+    if not (1 <= alpha_matting_foreground_threshold <= 255):
+        raise HTTPException(status_code=422, detail="alpha_matting_foreground_threshold must be between 1 and 255")
+    if not (0 <= alpha_matting_background_threshold <= 254):
+        raise HTTPException(status_code=422, detail="alpha_matting_background_threshold must be between 0 and 254")
+    if not (0 <= alpha_matting_erode_size <= 30):
+        raise HTTPException(status_code=422, detail="alpha_matting_erode_size must be between 0 and 30")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
@@ -97,9 +220,9 @@ def health():
 @app.post("/remove-background")
 async def remove_background(
     image: UploadFile = File(...),
-    whitespace_percent: float = Form(default=10.0),
-    bg_color: Optional[str] = Form(default=None),
-    output_size: Optional[int] = Form(default=None),
+    whitespace_percent: float = Form(default=15.0),
+    bg_color: Optional[str] = Form(default="white"),
+    output_size: Optional[int] = Form(default=1800),
     feathering: float = Form(default=0.0),
     alpha_threshold: int = Form(default=0),
     alpha_matting: bool = Form(default=False),
@@ -107,66 +230,23 @@ async def remove_background(
     alpha_matting_background_threshold: int = Form(default=10),
     alpha_matting_erode_size: int = Form(default=10),
 ):
-    """
-    Processing pipeline:
-    1. Remove background from the uploaded image using rembg (u2net, CUDA).
-    2. Tight-crop to the bounding box of the remaining subject.
-    3. If output_size is set: determine the longest axis of the subject,
-       build a square canvas of that size centred on the subject, then
-       resize the whole square to output_size × output_size.
-       Otherwise use the original image dimensions as the canvas.
-    4. Scale the subject so it fills (100 - whitespace_percent)% of the canvas
-       (longest axis, aspect ratio preserved).
-    5. Centre the scaled subject on the canvas.
-    6. Fill canvas with bg_color when provided (→ JPEG), else keep transparent (→ PNG).
-    """
-    if not (0.0 <= whitespace_percent < 100.0):
-        raise HTTPException(
-            status_code=422,
-            detail="whitespace_percent must be >= 0 and < 100",
-        )
-    if output_size is not None and output_size < 1:
-        raise HTTPException(
-            status_code=422,
-            detail="output_size must be a positive integer",
-        )
-    if not (0.0 <= feathering <= 20.0):
-        raise HTTPException(
-            status_code=422,
-            detail="feathering must be between 0 and 20",
-        )
-    if not (0 <= alpha_threshold <= 254):
-        raise HTTPException(
-            status_code=422,
-            detail="alpha_threshold must be between 0 and 254",
-        )
-    if not (1 <= alpha_matting_foreground_threshold <= 255):
-        raise HTTPException(
-            status_code=422,
-            detail="alpha_matting_foreground_threshold must be between 1 and 255",
-        )
-    if not (0 <= alpha_matting_background_threshold <= 254):
-        raise HTTPException(
-            status_code=422,
-            detail="alpha_matting_background_threshold must be between 0 and 254",
-        )
-    if not (0 <= alpha_matting_erode_size <= 30):
-        raise HTTPException(
-            status_code=422,
-            detail="alpha_matting_erode_size must be between 0 and 30",
-        )
+    validate_params(
+        whitespace_percent, output_size, feathering, alpha_threshold,
+        alpha_matting_foreground_threshold, alpha_matting_background_threshold,
+        alpha_matting_erode_size,
+    )
 
-    # ── Read input ────────────────────────────────────────────────────────────
+    # 1. Read and decode the uploaded image
     raw = await image.read()
     try:
         input_img = Image.open(io.BytesIO(raw)).convert("RGBA")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Cannot open image: {exc}")
 
-    W, H = input_img.size
+    original_w, original_h = input_img.size
 
-    # ── Remove background via GPU serving endpoint ──────────────────────────
-    result_rgba: Image.Image = _call_rembg(
+    # 2. Remove background via GPU serving endpoint
+    result_rgba = call_rembg(
         input_img,
         alpha_matting=alpha_matting,
         alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
@@ -174,70 +254,26 @@ async def remove_background(
         alpha_matting_erode_size=alpha_matting_erode_size,
     )
 
-    # ── Alpha channel post-processing ─────────────────────────────────────────
-    if feathering > 0.0 or alpha_threshold > 0:
-        from PIL import ImageChops, ImageFilter
-        r, g, b, a = result_rgba.split()
-        if feathering > 0.0:
-            a = a.filter(ImageFilter.GaussianBlur(radius=feathering))
-        if alpha_threshold > 0:
-            # Zero out any pixel at or below the threshold
-            cutoff = a.point(lambda p: 0 if p <= alpha_threshold else p)
-            a = cutoff
-        result_rgba = Image.merge("RGBA", (r, g, b, a))
+    # 3. Apply feathering / alpha threshold post-processing
+    result_rgba = apply_alpha_post_processing(result_rgba, feathering, alpha_threshold)
 
-    # ── Tight-crop to subject ─────────────────────────────────────────────────
+    # 4. Tight-crop to the bounding box of the subject
     bbox = result_rgba.getbbox()
     if bbox is None:
-        subject_resized = None
-        new_w = new_h = 0
-    else:
-        subject = result_rgba.crop(bbox)
-        w_s, h_s = subject.size
+        canvas_size = (output_size, output_size) if output_size else (original_w, original_h)
+        return encode_output(build_canvas(canvas_size, bg_color), bg_color)
 
-        # ── Determine canvas size ─────────────────────────────────────────────
-        if output_size is not None:
-            # Square canvas: use the requested output_size for both axes
-            C = output_size
-        else:
-            # Preserve original image dimensions
-            C = None
+    subject = result_rgba.crop(bbox)
 
-        canvas_w = C if C is not None else W
-        canvas_h = C if C is not None else H
+    # 5. Determine canvas size (square if output_size set, else original dimensions)
+    canvas_size = (output_size, output_size) if output_size else (original_w, original_h)
 
-        target_fill = 1.0 - whitespace_percent / 100.0
-        scale = min((canvas_w * target_fill) / w_s, (canvas_h * target_fill) / h_s)
-        new_w = max(1, round(w_s * scale))
-        new_h = max(1, round(h_s * scale))
-        subject_resized = subject.resize((new_w, new_h), Image.LANCZOS)
+    # 6. Scale subject to fill canvas (respecting whitespace_percent)
+    subject_resized, paste_offset = scale_subject_onto_canvas(subject, canvas_size, whitespace_percent)
 
-    # ── Build canvas ──────────────────────────────────────────────────────────
-    canvas_w = output_size if output_size is not None else W
-    canvas_h = output_size if output_size is not None else H
-    if bg_color:
-        try:
-            r, g, b = ImageColor.getrgb(bg_color)
-            canvas = Image.new("RGBA", (canvas_w, canvas_h), (r, g, b, 255))
-        except (ValueError, AttributeError):
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid bg_color: {bg_color!r}. Use a CSS name or hex, e.g. #ff0000.",
-            )
-    else:
-        canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    # 7. Build canvas and paste subject centred
+    canvas = build_canvas(canvas_size, bg_color)
+    canvas.paste(subject_resized, paste_offset, subject_resized)
 
-    # ── Paste subject centred ─────────────────────────────────────────────────
-    if subject_resized is not None:
-        paste_x = (canvas_w - new_w) // 2
-        paste_y = (canvas_h - new_h) // 2
-        canvas.paste(subject_resized, (paste_x, paste_y), subject_resized)
-
-    # ── Encode and return ─────────────────────────────────────────────────────
-    buf = io.BytesIO()
-    if bg_color:
-        canvas.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
-        return Response(content=buf.getvalue(), media_type="image/jpeg")
-    else:
-        canvas.save(buf, format="PNG", optimize=True)
-        return Response(content=buf.getvalue(), media_type="image/png")
+    # 8. Encode and return
+    return encode_output(canvas, bg_color)
