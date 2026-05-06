@@ -16,6 +16,12 @@ POST /remove-background
                                   crops a square region centred on the subject then
                                   scales to output_size × output_size
                                   omit to preserve the original image dimensions
+    feathering         : (float)  Gaussian blur radius applied to the alpha channel, default 0
+                                  0 = hard edges as returned by rembg
+                                  range 0–20 (practical); higher = softer/more feathered edges
+    alpha_threshold    : (int)    pixels with alpha ≤ this value are clipped to 0, default 0
+                                  0 = keep all semi-transparent pixels rembg produced
+                                  range 0–254; higher = harder cutoff, removes fringe pixels
 
 GET /health
     → {"status": "ok"}
@@ -73,6 +79,8 @@ async def remove_background(
     whitespace_percent: float = Form(default=10.0),
     bg_color: Optional[str] = Form(default=None),
     output_size: Optional[int] = Form(default=None),
+    feathering: float = Form(default=0.0),
+    alpha_threshold: int = Form(default=0),
 ):
     """
     Processing pipeline:
@@ -97,6 +105,16 @@ async def remove_background(
             status_code=422,
             detail="output_size must be a positive integer",
         )
+    if not (0.0 <= feathering <= 20.0):
+        raise HTTPException(
+            status_code=422,
+            detail="feathering must be between 0 and 20",
+        )
+    if not (0 <= alpha_threshold <= 254):
+        raise HTTPException(
+            status_code=422,
+            detail="alpha_threshold must be between 0 and 254",
+        )
 
     # ── Read input ────────────────────────────────────────────────────────────
     raw = await image.read()
@@ -109,6 +127,18 @@ async def remove_background(
 
     # ── Remove background via GPU serving endpoint ──────────────────────────
     result_rgba: Image.Image = _call_rembg(input_img)
+
+    # ── Alpha channel post-processing ─────────────────────────────────────────
+    if feathering > 0.0 or alpha_threshold > 0:
+        from PIL import ImageChops, ImageFilter
+        r, g, b, a = result_rgba.split()
+        if feathering > 0.0:
+            a = a.filter(ImageFilter.GaussianBlur(radius=feathering))
+        if alpha_threshold > 0:
+            # Zero out any pixel at or below the threshold
+            cutoff = a.point(lambda p: 0 if p <= alpha_threshold else p)
+            a = cutoff
+        result_rgba = Image.merge("RGBA", (r, g, b, a))
 
     # ── Tight-crop to subject ─────────────────────────────────────────────────
     bbox = result_rgba.getbbox()
