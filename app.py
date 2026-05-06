@@ -12,6 +12,10 @@ POST /remove-background
                                   e.g. 15 → subject fills 85% of the output image
     bg_color           : (string) optional background fill, e.g. "white" or "#ff0000"
                                   omit entirely for a transparent PNG output
+    output_size        : (int)    optional square output canvas in pixels, e.g. 1800
+                                  crops a square region centred on the subject then
+                                  scales to output_size × output_size
+                                  omit to preserve the original image dimensions
 
 GET /health
     → {"status": "ok"}
@@ -68,20 +72,30 @@ async def remove_background(
     image: UploadFile = File(...),
     whitespace_percent: float = Form(default=10.0),
     bg_color: Optional[str] = Form(default=None),
+    output_size: Optional[int] = Form(default=None),
 ):
     """
     Processing pipeline:
     1. Remove background from the uploaded image using rembg (u2net, CUDA).
     2. Tight-crop to the bounding box of the remaining subject.
-    3. Scale the subject so it fills (100 - whitespace_percent)% of the
-       original canvas dimensions (longest axis, aspect ratio preserved).
-    4. Centre the scaled subject on a canvas matching the original image size.
-    5. Fill canvas with bg_color when provided (→ JPEG), else keep transparent (→ PNG).
+    3. If output_size is set: determine the longest axis of the subject,
+       build a square canvas of that size centred on the subject, then
+       resize the whole square to output_size × output_size.
+       Otherwise use the original image dimensions as the canvas.
+    4. Scale the subject so it fills (100 - whitespace_percent)% of the canvas
+       (longest axis, aspect ratio preserved).
+    5. Centre the scaled subject on the canvas.
+    6. Fill canvas with bg_color when provided (→ JPEG), else keep transparent (→ PNG).
     """
     if not (0.0 <= whitespace_percent < 100.0):
         raise HTTPException(
             status_code=422,
             detail="whitespace_percent must be >= 0 and < 100",
+        )
+    if output_size is not None and output_size < 1:
+        raise HTTPException(
+            status_code=422,
+            detail="output_size must be a positive integer",
         )
 
     # ── Read input ────────────────────────────────────────────────────────────
@@ -99,36 +113,48 @@ async def remove_background(
     # ── Tight-crop to subject ─────────────────────────────────────────────────
     bbox = result_rgba.getbbox()
     if bbox is None:
-        # Nothing detected — return blank canvas at original size
         subject_resized = None
         new_w = new_h = 0
     else:
         subject = result_rgba.crop(bbox)
         w_s, h_s = subject.size
 
+        # ── Determine canvas size ─────────────────────────────────────────────
+        if output_size is not None:
+            # Square canvas: use the requested output_size for both axes
+            C = output_size
+        else:
+            # Preserve original image dimensions
+            C = None
+
+        canvas_w = C if C is not None else W
+        canvas_h = C if C is not None else H
+
         target_fill = 1.0 - whitespace_percent / 100.0
-        scale = min((W * target_fill) / w_s, (H * target_fill) / h_s)
+        scale = min((canvas_w * target_fill) / w_s, (canvas_h * target_fill) / h_s)
         new_w = max(1, round(w_s * scale))
         new_h = max(1, round(h_s * scale))
         subject_resized = subject.resize((new_w, new_h), Image.LANCZOS)
 
     # ── Build canvas ──────────────────────────────────────────────────────────
+    canvas_w = output_size if output_size is not None else W
+    canvas_h = output_size if output_size is not None else H
     if bg_color:
         try:
             r, g, b = ImageColor.getrgb(bg_color)
-            canvas = Image.new("RGBA", (W, H), (r, g, b, 255))
+            canvas = Image.new("RGBA", (canvas_w, canvas_h), (r, g, b, 255))
         except (ValueError, AttributeError):
             raise HTTPException(
                 status_code=422,
                 detail=f"Invalid bg_color: {bg_color!r}. Use a CSS name or hex, e.g. #ff0000.",
             )
     else:
-        canvas = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        canvas = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
 
     # ── Paste subject centred ─────────────────────────────────────────────────
     if subject_resized is not None:
-        paste_x = (W - new_w) // 2
-        paste_y = (H - new_h) // 2
+        paste_x = (canvas_w - new_w) // 2
+        paste_y = (canvas_h - new_h) // 2
         canvas.paste(subject_resized, (paste_x, paste_y), subject_resized)
 
     # ── Encode and return ─────────────────────────────────────────────────────
