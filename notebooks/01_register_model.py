@@ -39,7 +39,20 @@ class RembgModel(mlflow.pyfunc.PythonModel):
         for _, row in model_input.iterrows():
             raw = base64.b64decode(row["image_b64"])
             img = Image.open(io.BytesIO(raw)).convert("RGBA")
-            result = remove(img, session=self._session)
+
+            am    = bool(row.get("alpha_matting", False))
+            am_fg = int(row.get("alpha_matting_foreground_threshold", 240))
+            am_bg = int(row.get("alpha_matting_background_threshold", 10))
+            am_er = int(row.get("alpha_matting_erode_size", 10))
+
+            result = remove(
+                img,
+                session=self._session,
+                alpha_matting=am,
+                alpha_matting_foreground_threshold=am_fg,
+                alpha_matting_background_threshold=am_bg,
+                alpha_matting_erode_size=am_er,
+            )
             buf = io.BytesIO()
             result.save(buf, format="PNG")
             results.append({"rgba_b64": base64.b64encode(buf.getvalue()).decode()})
@@ -67,7 +80,13 @@ mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment(EXPERIMENT_PATH)
 
 _SIGNATURE = ModelSignature(
-    inputs=Schema([ColSpec("string", "image_b64")]),
+    inputs=Schema([
+        ColSpec("string",  "image_b64"),
+        ColSpec("boolean", "alpha_matting"),
+        ColSpec("long",    "alpha_matting_foreground_threshold"),
+        ColSpec("long",    "alpha_matting_background_threshold"),
+        ColSpec("long",    "alpha_matting_erode_size"),
+    ]),
     outputs=Schema([ColSpec("string", "rgba_b64")]),
 )
 

@@ -16,6 +16,15 @@ POST /remove-background
                                   crops a square region centred on the subject then
                                   scales to output_size × output_size
                                   omit to preserve the original image dimensions
+    alpha_matting                  : (bool)  enable alpha matting for tighter edges, default false
+                                  uses the original image's colour data to re-solve
+                                  the uncertain boundary zone — best for coloured backgrounds
+    alpha_matting_foreground_threshold : (int) confidence ≥ this = definite foreground, default 240
+                                  range 1–255
+    alpha_matting_background_threshold : (int) confidence ≤ this = definite background, default 10
+                                  range 0–254
+    alpha_matting_erode_size       : (int)  how aggressively to erode the uncertain zone, default 10
+                                  range 0–30
     feathering         : (float)  Gaussian blur radius applied to the alpha channel, default 0
                                   0 = hard edges as returned by rembg
                                   range 0–20 (practical); higher = softer/more feathered edges
@@ -51,14 +60,26 @@ _client   = WorkspaceClient()  # auto-authenticates inside a Databricks App
 print(f"Inference endpoint: {_ENDPOINT}", flush=True)
 
 
-def _call_rembg(img: Image.Image) -> Image.Image:
+def _call_rembg(
+    img: Image.Image,
+    alpha_matting: bool = False,
+    alpha_matting_foreground_threshold: int = 240,
+    alpha_matting_background_threshold: int = 10,
+    alpha_matting_erode_size: int = 10,
+) -> Image.Image:
     """Send image to the GPU Model Serving endpoint; return RGBA result."""
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     try:
         response = _client.serving_endpoints.query(
             name=_ENDPOINT,
-            dataframe_records=[{"image_b64": base64.b64encode(buf.getvalue()).decode()}],
+            dataframe_records=[{
+                "image_b64": base64.b64encode(buf.getvalue()).decode(),
+                "alpha_matting": alpha_matting,
+                "alpha_matting_foreground_threshold": alpha_matting_foreground_threshold,
+                "alpha_matting_background_threshold": alpha_matting_background_threshold,
+                "alpha_matting_erode_size": alpha_matting_erode_size,
+            }],
         )
     except Exception as e:
         raise HTTPException(
@@ -81,6 +102,10 @@ async def remove_background(
     output_size: Optional[int] = Form(default=None),
     feathering: float = Form(default=0.0),
     alpha_threshold: int = Form(default=0),
+    alpha_matting: bool = Form(default=False),
+    alpha_matting_foreground_threshold: int = Form(default=240),
+    alpha_matting_background_threshold: int = Form(default=10),
+    alpha_matting_erode_size: int = Form(default=10),
 ):
     """
     Processing pipeline:
@@ -115,6 +140,21 @@ async def remove_background(
             status_code=422,
             detail="alpha_threshold must be between 0 and 254",
         )
+    if not (1 <= alpha_matting_foreground_threshold <= 255):
+        raise HTTPException(
+            status_code=422,
+            detail="alpha_matting_foreground_threshold must be between 1 and 255",
+        )
+    if not (0 <= alpha_matting_background_threshold <= 254):
+        raise HTTPException(
+            status_code=422,
+            detail="alpha_matting_background_threshold must be between 0 and 254",
+        )
+    if not (0 <= alpha_matting_erode_size <= 30):
+        raise HTTPException(
+            status_code=422,
+            detail="alpha_matting_erode_size must be between 0 and 30",
+        )
 
     # ── Read input ────────────────────────────────────────────────────────────
     raw = await image.read()
@@ -126,7 +166,13 @@ async def remove_background(
     W, H = input_img.size
 
     # ── Remove background via GPU serving endpoint ──────────────────────────
-    result_rgba: Image.Image = _call_rembg(input_img)
+    result_rgba: Image.Image = _call_rembg(
+        input_img,
+        alpha_matting=alpha_matting,
+        alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
+        alpha_matting_background_threshold=alpha_matting_background_threshold,
+        alpha_matting_erode_size=alpha_matting_erode_size,
+    )
 
     # ── Alpha channel post-processing ─────────────────────────────────────────
     if feathering > 0.0 or alpha_threshold > 0:
