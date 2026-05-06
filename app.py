@@ -219,16 +219,74 @@ def health():
 
 @app.post("/remove-background")
 async def remove_background(
-    image: UploadFile = File(...),
-    whitespace_percent: float = Form(default=15.0),
-    bg_color: Optional[str] = Form(default="white"),
-    output_size: Optional[int] = Form(default=1800),
-    feathering: float = Form(default=0.0),
-    alpha_threshold: int = Form(default=0),
-    alpha_matting: bool = Form(default=False),
-    alpha_matting_foreground_threshold: int = Form(default=240),
-    alpha_matting_background_threshold: int = Form(default=10),
-    alpha_matting_erode_size: int = Form(default=10),
+    image: UploadFile = File(..., description="Input image (JPEG, PNG, WebP, or any PIL-readable format)."),
+    whitespace_percent: float = Form(
+        default=15.0,
+        description=(
+            "Padding to leave around the subject (0–99). "
+            "15 means the subject fills 85% of the canvas. "
+            "Lower = subject larger; higher = more breathing room."
+        ),
+    ),
+    bg_color: Optional[str] = Form(
+        default="white",
+        description=(
+            "Background colour. Accepts CSS names (white, red) or hex (#ff0000). "
+            "Output is a JPEG when set. Pass empty for a transparent PNG."
+        ),
+    ),
+    output_size: Optional[int] = Form(
+        default=1800,
+        description=(
+            "Output canvas size in pixels (square: output_size x output_size). "
+            "Subject is scaled to fit and centred. Pass empty to keep original dimensions."
+        ),
+    ),
+    feathering: float = Form(
+        default=0.0,
+        description=(
+            "Softens cutout edges by blurring the alpha channel (0–20). "
+            "0 = hard edges. Higher = softer, more gradual edge blend. "
+            "Useful when compositing onto a new background."
+        ),
+    ),
+    alpha_threshold: int = Form(
+        default=0,
+        description=(
+            "Clips semi-transparent fringe pixels to fully transparent (0–254). "
+            "0 = keep all model output. Higher cuts halo/colour bleed more aggressively. "
+            "Try 15–40 to remove a thin outline around the subject."
+        ),
+    ),
+    alpha_matting: bool = Form(
+        default=True,
+        description=(
+            "Enable alpha matting for tighter, more accurate edges. "
+            "Re-examines uncertain boundary pixels using original image colours. "
+            "Best when subject and background have distinct colours. ~2-5x slower."
+        ),
+    ),
+    alpha_matting_foreground_threshold: int = Form(
+        default=240,
+        description=(
+            "Used when alpha_matting=true. Pixels with confidence >= this are definite foreground (1–255). "
+            "Lower = more pixels classified as 'definitely subject'."
+        ),
+    ),
+    alpha_matting_background_threshold: int = Form(
+        default=30,
+        description=(
+            "Used when alpha_matting=true. Pixels with confidence <= this are definite background (0–254). "
+            "Higher = more pixels classified as 'definitely background'."
+        ),
+    ),
+    alpha_matting_erode_size: int = Form(
+        default=1,
+        description=(
+            "Used when alpha_matting=true. Shrinks the uncertain boundary zone before matting (0–30). "
+            "Higher = tighter initial mask; lower = more pixels re-examined."
+        ),
+    ),
 ):
     validate_params(
         whitespace_percent, output_size, feathering, alpha_threshold,
