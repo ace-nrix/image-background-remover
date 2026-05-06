@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Background removal API — FastAPI + rembg (CUDA).
+Background removal API — FastAPI + Databricks Model Serving (GPU).
+
+The heavy inference (rembg u2net) runs on a GPU-backed Databricks Model
+Serving endpoint. This app handles HTTP, image encoding, cropping, scaling,
+and canvas composition on CPU serverless compute.
 
 POST /remove-background
     image              : (file)   input image, any format PIL can read
@@ -11,25 +15,47 @@ POST /remove-background
 
 GET /health
     → {"status": "ok"}
+
+Required environment variables:
+    DATABRICKS_HOST            Workspace URL, e.g. https://adb-....azuredatabricks.net
+    DATABRICKS_TOKEN           Personal access token or service-principal secret
+    REMBG_SERVING_ENDPOINT     Model Serving endpoint name (default: rembg-u2net)
 """
 
+import base64
 import io
+import os
 from typing import Optional
 
+from databricks.sdk import WorkspaceClient
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from PIL import Image, ImageColor
-from rembg import new_session, remove
 
-app = FastAPI(title="Image Background Remover API", version="1.0.0")
+app = FastAPI(title="Image Background Remover API", version="2.0.0")
 
-# Load model once at startup (~170 MB, cached in ~/.u2net after first download)
-print("Loading rembg model (u2net) …", flush=True)
-_session = new_session(
-    "u2net",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-)
-print("Model loaded.", flush=True)
+# ── Serving endpoint config ───────────────────────────────────────────────────
+_ENDPOINT = os.environ.get("REMBG_SERVING_ENDPOINT", "rembg-u2net")
+_client   = WorkspaceClient()  # auto-authenticates inside a Databricks App
+
+print(f"Inference endpoint: {_ENDPOINT}", flush=True)
+
+
+def _call_rembg(img: Image.Image) -> Image.Image:
+    """Send image to the GPU Model Serving endpoint; return RGBA result."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    try:
+        response = _client.serving_endpoints.query(
+            name=_ENDPOINT,
+            dataframe_records=[{"image_b64": base64.b64encode(buf.getvalue()).decode()}],
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=502, detail=f"Background removal service unavailable: {e}"
+        )
+    rgba_b64 = response.predictions[0]["rgba_b64"]
+    return Image.open(io.BytesIO(base64.b64decode(rgba_b64)))
 
 
 @app.get("/health")
@@ -67,8 +93,8 @@ async def remove_background(
 
     W, H = input_img.size
 
-    # ── Remove background ─────────────────────────────────────────────────────
-    result_rgba: Image.Image = remove(input_img, session=_session)
+    # ── Remove background via GPU serving endpoint ──────────────────────────
+    result_rgba: Image.Image = _call_rembg(input_img)
 
     # ── Tight-crop to subject ─────────────────────────────────────────────────
     bbox = result_rgba.getbbox()

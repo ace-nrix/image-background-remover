@@ -16,6 +16,7 @@ $sep = "=" * 70
 $AppName    = "image-background-remover"
 $RemotePath = "/Workspace/ML_ai_squad/nrix/$AppName"
 $LocalPath  = (Resolve-Path "$PSScriptRoot\..").Path
+$Profile    = "nrix"
 
 # File extensions to upload
 $UploadExtensions = @('.py', '.txt', '.yaml', '.yml', '.json', '.sh')
@@ -28,7 +29,7 @@ Write-Host $sep -ForegroundColor Cyan
 Write-Host "STEP 1 - Creating workspace directory" -ForegroundColor Cyan
 Write-Host $sep -ForegroundColor Cyan
 
-databricks workspace mkdirs $RemotePath
+databricks workspace mkdirs $RemotePath --profile $Profile
 Write-Host "  [OK] Directories ready" -ForegroundColor Green
 
 # ── Step 2: Upload source files ───────────────────────────────────────────────
@@ -48,9 +49,9 @@ foreach ($f in $allFiles) {
 
     $parts     = $remoteDest -split '/'
     $remoteDir = ($parts[0..($parts.Count - 2)]) -join '/'
-    databricks workspace mkdirs $remoteDir 2>$null
+    databricks workspace mkdirs $remoteDir --profile $Profile | Out-Null
 
-    databricks workspace import $remoteDest --file $f.FullName --format RAW --overwrite
+    databricks workspace import $remoteDest --file $f.FullName --format RAW --overwrite --profile $Profile
     if ($LASTEXITCODE -eq 0) {
         Write-Host "  [OK]   $rel" -ForegroundColor Green
     } else {
@@ -67,7 +68,7 @@ Write-Host $sep -ForegroundColor Cyan
 Write-Host "STEP 3 - Deploying Databricks App: $AppName" -ForegroundColor Cyan
 Write-Host $sep -ForegroundColor Cyan
 
-databricks apps deploy $AppName --source-code-path $RemotePath
+databricks apps deploy $AppName --source-code-path $RemotePath --profile $Profile
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Deployment failed"
     exit 1
@@ -79,4 +80,4 @@ Write-Host "DEPLOY COMPLETE" -ForegroundColor Green
 Write-Host $sep -ForegroundColor Green
 Write-Host ""
 
-databricks apps get $AppName
+databricks apps get $AppName --profile $Profile
